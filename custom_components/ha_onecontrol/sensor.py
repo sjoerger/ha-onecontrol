@@ -29,6 +29,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONF_ADDRESS,
     EntityCategory,
+    UnitOfElectricCurrent,
     UnitOfElectricPotential,
     UnitOfTemperature,
     UnitOfTime,
@@ -105,7 +106,10 @@ async def async_setup_entry(
                 key = f"{item.table_id:02x}:{item.device_id:02x}"
                 if key not in discovered_covers:
                     discovered_covers.add(key)
-                    new.append(OneControlCoverStateSensor(coordinator, address, item.table_id, item.device_id))
+                    new.extend([
+                        OneControlCoverStateSensor(coordinator, address, item.table_id, item.device_id),
+                        OneControlCoverCurrentSensor(coordinator, address, item.table_id, item.device_id),
+                    ])
 
             elif isinstance(item, LevelerStatus):
                 key = f"{item.table_id:02x}:{item.device_id:02x}"
@@ -144,7 +148,10 @@ async def async_setup_entry(
     for key, cov in coordinator.covers.items():
         if key not in discovered_covers:
             discovered_covers.add(key)
-            entities.append(OneControlCoverStateSensor(coordinator, address, cov.table_id, cov.device_id))
+            entities.extend([
+                OneControlCoverStateSensor(coordinator, address, cov.table_id, cov.device_id),
+                OneControlCoverCurrentSensor(coordinator, address, cov.table_id, cov.device_id),
+            ])
     for key, lev in coordinator.levelers.items():
         if key not in discovered_levelers:
             discovered_levelers.add(key)
@@ -591,15 +598,17 @@ class OneControlHourMeterSensor(_OneControlSensorBase):
             self.async_write_ha_state()
 
 
-# ── Cover State Sensors (state-only, no control — INTERNALS.md safety) ───
+# ── Cover State Sensors ────────────────────────────────────────────────
 
 
 class OneControlCoverStateSensor(_OneControlSensorBase):
-    """Cover/Slide/Awning state as a sensor.
+    """Cover/Slide/Awning state as a plain-text sensor (Opening/Closing/Stopped).
 
-    Per INTERNALS.md safety decision covers are state-only:
-      "19A/39A H-bridge motors, no limit switches — no automatic safety."
-    Exposed as a text sensor (Opening/Closing/Stopped), NOT as a Cover entity.
+    Coexists with the real `cover.*` entity (cover.py), which now also
+    exposes open/close/stop control backed by current-based auto-stop
+    detection — see docs/TECH_SPEC.md § H-Bridge Cover Control. This sensor
+    predates that and is kept for a simple text-state view/history separate
+    from the cover entity's state machine.
     """
 
     _attr_icon = "mdi:blinds-horizontal"
@@ -642,6 +651,62 @@ class OneControlCoverStateSensor(_OneControlSensorBase):
         if cov.position is not None:
             attrs["position"] = cov.position
         return attrs
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._unsub()
+
+    @callback
+    def _on_event(self, event: Any) -> None:
+        if (
+            isinstance(event, CoverStatus)
+            and event.table_id == self._table_id
+            and event.device_id == self._device_id
+        ):
+            self.async_write_ha_state()
+
+
+class OneControlCoverCurrentSensor(_OneControlSensorBase):
+    """H-Bridge motor current draw (RELAY_TYPE_2_STATUS_PARAMS bytes 2-3).
+
+    Created for every cover/slide/awning H-bridge device, but reports
+    unavailable when the device doesn't populate this field (raw 0xFFFF —
+    observed on slides on hardware where only the awning wires it up).
+    """
+
+    _attr_icon = "mdi:current-dc"
+    _attr_native_unit_of_measurement = UnitOfElectricCurrent.AMPERE
+    _attr_device_class = SensorDeviceClass.CURRENT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 2
+
+    def __init__(
+        self,
+        coordinator: OneControlCoordinator,
+        address: str,
+        table_id: int,
+        device_id: int,
+    ) -> None:
+        super().__init__(coordinator, address)
+        self._table_id = table_id
+        self._device_id = device_id
+        self._key = f"{table_id:02x}:{device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_cover_current_{device_id:02x}"
+        self._unsub = coordinator.register_event_callback(self._on_event)
+
+    @property
+    def name(self) -> str:
+        base = self.coordinator.device_name(self._table_id, self._device_id)
+        return f"{base} Motor Current"
+
+    @property
+    def available(self) -> bool:
+        cov = self.coordinator.covers.get(self._key)
+        return super().available and bool(cov and cov.current_draw is not None)
+
+    @property
+    def native_value(self) -> float | None:
+        cov = self.coordinator.covers.get(self._key)
+        return cov.current_draw if cov else None
 
     async def async_will_remove_from_hass(self) -> None:
         self._unsub()

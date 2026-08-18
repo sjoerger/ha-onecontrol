@@ -114,6 +114,12 @@ from .protocol.events import (
     parse_event,
     parse_metadata_response,
 )
+from .protocol.cover_inference import (
+    CoverStallInference,
+    DEFAULT_EXTEND_STALL_CONFIRM_SAMPLES,
+    DEFAULT_EXTEND_STALL_CURRENT_A,
+    DEFAULT_EXTEND_STALL_WARMUP_SAMPLES,
+)
 from .protocol.dtc_codes import get_name as dtc_get_name, is_fault as dtc_is_fault
 from .protocol.function_names import get_friendly_name
 from .protocol.tea import (
@@ -141,6 +147,52 @@ _STARTUP_BOOTSTRAP_TIMEOUT_SECONDS = 600.0
 # Seconds to wait after metadata loads before seeding entities for silent
 # (always-off) devices.  Lets the initial BLE event burst settle first.
 _METADATA_SEED_DELAY_S = 2.0
+
+# H-Bridge (cover/awning) auto-close motion. Values taken from the decompiled
+# vendor app (temp/decompiled_source/assembly_0176/OneControl.Devices/
+# LogicalDeviceRelayHBridgeMomentary.cs) rather than guessed: the official
+# app keeps a relay energized by resending the direction command every
+# RelayDirectionSendTimeMs=500 while a button is held; the device itself
+# auto-stops if it doesn't receive a fresh direction command within
+# MsCommandDirectionAutoStopTimeout=800ms. That 800ms device-side watchdog
+# is a real backstop here — even if every one of our own Stop sends fails,
+# motion halts on its own shortly after we stop resending. The vendor also
+# never trusts a single Stop send (MaxStopCommands=5 on cancel; a dedicated
+# panic-stop path retries up to 10x), so we don't either.
+_HBRIDGE_RESEND_INTERVAL_S = 0.5
+_HBRIDGE_STOP_BURST_COUNT = 5
+_HBRIDGE_STOP_BURST_INTERVAL_S = 0.15
+# Hard ceiling independent of the current-based stall detector — backstop
+# against a missed/failed detection. Real full retracts observed so far take
+# ~35s; this is comfortably above that.
+_HBRIDGE_MAX_CLOSE_RUNTIME_S = 60.0
+
+# TEST FORWARD (extend) — diagnostic only, deliberately has NO current-based
+# auto-stop. There is NO auto-reverse safety behavior on this hardware —
+# past full extension the motor keeps driving Forward and the fabric starts
+# wrapping backward on the roller; if driven far enough, the roller/arms will
+# reach the RV sidewall. See _HBRIDGE_MAX_OPEN_RUNTIME_S below for
+# async_start_hbridge_open, which DOES use the current-based signature and is
+# wired into the real cover's open_cover. This watchdog is an arbitrary
+# diagnostic ceiling only — it does NOT guarantee the wrap stays clear of the
+# sidewall before it fires, so it is not a substitute for watching closely
+# and stopping manually well before full extension.
+_HBRIDGE_TEST_FORWARD_MAX_RUNTIME_S = 32.0
+
+# OPEN (auto-extend) — hard ceiling independent of the extend-impact current
+# detector (CoverStallInference / DEFAULT_EXTEND_STALL_CURRENT_A = 4.0A,
+# 1-sample confirm, 2-sample warm-up — see protocol/cover_inference.py for
+# the full tuning history: 2-sample confirm, then 6.5A/1-sample, then
+# 5.0A/1-sample all still let the awning overshoot into visibly wrapping
+# backward before stopping; a dip-based trigger was also tried and reverted
+# after a live false-early-stop, logs-27). Real full extends observed so far
+# all land at ~25.6-27.24s; this ceiling sits well above that so the
+# current-based stop gets a fair chance to fire first — it is a backstop
+# against a missed/failed detection, not the primary mechanism. There is NO
+# auto-reverse backstop on this hardware — if this fires, the wrap toward
+# the RV sidewall has already been happening for a while.
+_HBRIDGE_MAX_OPEN_RUNTIME_S = 40.0
+
 
 # IDS-CAN relay command verification/retry tuning.
 # V1 gateways can emit delayed DEVICE_STATUS updates after a command even when
@@ -457,6 +509,49 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.dimmable_lights: dict[str, DimmableLight] = {}
         self.rgb_lights: dict[str, RgbLight] = {}
         self.covers: dict[str, CoverStatus] = {}
+        # Passive retract-stall open/closed inference — see protocol/cover_inference.py.
+        self._cover_stall_inference = CoverStallInference()
+        # Passive extend-stall (full-extension impact) inference — same module.
+        # Lower threshold, "opening"-direction, single-sample confirm (steep
+        # ramp, not noisy like retract), 2-sample warm-up (skips the startup
+        # inrush spike, which alone can exceed this low a threshold), no
+        # closed/stowed inference (get() unused here) — see
+        # cover_inference.py module docstring for evidence.
+        self._extend_stall_inference = CoverStallInference(
+            stall_current_a=DEFAULT_EXTEND_STALL_CURRENT_A,
+            confirm_samples=DEFAULT_EXTEND_STALL_CONFIRM_SAMPLES,
+            target_state="opening",
+            warmup_samples=DEFAULT_EXTEND_STALL_WARMUP_SAMPLES,
+        )
+        # ExtendDipDetector (protocol/cover_inference.py) was tried here and
+        # reverted: on its first live trial (temp/logs-27) it confirmed a
+        # false-early-stop — the awning stopped ~2s short of full extension,
+        # user had to finish it via wall switch. The normal pre-dip current
+        # taper varies further than the 4 trials backing the threshold
+        # suggested (that trial's taper reached 1.26A vs. the confirmed real
+        # dip range of 0.96-1.00A — only ~0.3A of margin, not safely
+        # separable on this little data). User's call: a small ramp-detector
+        # overshoot is an acceptable tradeoff since it hasn't caused
+        # problems retracting afterward, whereas stopping short defeats the
+        # point of an auto-extend. The class itself is left in
+        # cover_inference.py, unwired, in case it's worth another look with
+        # much more data establishing the taper's real floor.
+        # Set by _update_cover_stall_inference the instant either stall
+        # detector's is_stalled() goes true for a device with an active
+        # motion loop (_hbridge_close_loop or _hbridge_open_loop),
+        # so that loop can react immediately instead of waiting up to a full
+        # _HBRIDGE_RESEND_INTERVAL_S for its own polling cadence to notice —
+        # confirmed on real hardware (temp/logs-23) that plain polling adds
+        # ~300ms+ of pure lag on top of the extend impact ramp already being
+        # nearly vertical, worsening the overshoot there. Retract has much
+        # more margin (10A threshold vs. 15-17A confirmed stalls) but the
+        # same latency applies — one shared dict is safe since only one
+        # direction's loop is ever active per device (_hbridge_motion_tasks
+        # is single-slot per key; starting either cancels the other).
+        self._hbridge_stall_events: dict[str, asyncio.Event] = {}
+        # Active auto-close motion loops, keyed by device — see
+        # async_start_hbridge_close / _hbridge_close_loop.
+        self._hbridge_motion_tasks: dict[str, asyncio.Task] = {}
         self.hvac_zones: dict[str, HvacZone] = {}
         self.tanks: dict[str, TankLevel] = {}
         self.device_online: dict[str, DeviceOnline] = {}
@@ -596,6 +691,53 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Return friendly name or fallback like 'Device 0B:05'."""
         key = _device_key(table_id, device_id)
         return self.device_names.get(key, f"Device {key.upper()}")
+
+    def cover_inferred_closed(self, table_id: int, device_id: int) -> bool | None:
+        """Best-guess stowed state for a cover, from passive stall inference.
+
+        True only after a closing motion ended in a confirmed current stall;
+        False as soon as any opening motion is observed; None (unknown) before
+        either has ever been observed — e.g. right after startup/reconnect, or
+        for a device that has only ever been seen stopped.  See
+        protocol/cover_inference.py for the (unverified, single-capture-derived)
+        threshold this is based on.
+        """
+        return self._cover_stall_inference.get(_device_key(table_id, device_id))
+
+    def _update_cover_stall_inference(self, event: CoverStatus) -> None:
+        """Passively track retract-stall and extend-impact current streaks.
+
+        Purely observational — reacts to status frames whoever drove the
+        motion (wall switch or, in future, HA).  Never sends a command.
+        """
+        key = _device_key(event.table_id, event.device_id)
+        streak = self._cover_stall_inference.update(key, event)
+        if streak is not None:
+            _LOGGER.info(
+                "Cover %s: retract stall inferred (%d samples) — marking closed/stowed",
+                self.device_name(event.table_id, event.device_id),
+                streak,
+            )
+        extend_streak = self._extend_stall_inference.update(key, event)
+        if extend_streak is not None:
+            _LOGGER.info(
+                "Cover %s: full-extension impact current inferred (%d samples)",
+                self.device_name(event.table_id, event.device_id),
+                extend_streak,
+            )
+        # is_stalled() can go true on a "closing"/"opening" frame directly
+        # (that's the whole point of is_stalled() vs. update()'s return value
+        # — see its docstring). Wake any waiting motion loop immediately
+        # rather than let it find out on its next poll; harmless to check
+        # both detectors regardless of which loop (if any) is active for
+        # this device, since a stall on the "wrong" direction's detector
+        # can't be true here (opposite-state frames reset that streak).
+        stall_event = self._hbridge_stall_events.get(key)
+        if stall_event is not None and (
+            self._cover_stall_inference.is_stalled(key)
+            or self._extend_stall_inference.is_stalled(key)
+        ):
+            stall_event.set()
 
     def register_event_callback(self, cb: Callable[[Any], None]) -> Callable[[], None]:
         """Register a callback for parsed events. Returns unsubscribe callable."""
@@ -765,6 +907,365 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         cmd = self._cmd.build_action_switch(table_id, state, [device_id])
         await self.async_send_command(cmd)
+
+    async def async_test_hbridge_stop(self, table_id: int, device_id: int) -> None:
+        """DIAGNOSTIC: send a bare HBridge Stop command to one H-bridge device.
+
+        MUST cancel any active resend loop first (async_stop_hbridge_motion) —
+        confirmed on real hardware that sending only a single bare Stop here
+        while a loop (Test Forward or auto-retract) is running does NOT stop
+        it: the loop's next 500ms resend just overrides the momentary Stop,
+        and the device kept extending through 18 repeated presses of this
+        button across two ~32s sessions, stopped only by the runtime
+        watchdog both times. This still also sends its own explicit Stop
+        below for diagnostic visibility when nothing is running — logged at
+        INFO since this is a live motor command test, not routine traffic.
+        """
+        await self.async_stop_hbridge_motion(table_id, device_id)
+        _LOGGER.info(
+            "Cover %s: sending TEST Stop command (table=%d device=0x%02X) — "
+            "unverified payload, watch for the motor actually halting",
+            self.device_name(table_id, device_id),
+            table_id,
+            device_id,
+        )
+        cmd = self._cmd.build_action_hbridge(
+            table_id, device_id, CommandBuilder.HBRIDGE_COMMAND_STOP
+        )
+        await self.async_send_command(cmd)
+
+    async def async_test_hbridge_reverse(self, table_id: int, device_id: int) -> None:
+        """DIAGNOSTIC: send a bare HBridge Reverse command to one H-bridge device.
+
+        Command byte is now 0x03 (RelayHBridgeDirection.Reverse), changed
+        from the earlier 0x02 attempt which was confirmed by observation to
+        extend the awning instead of retracting it — see commands.py note.
+        Isolated test only — starts real motion with NO auto-stop attached,
+        and Stop's reliability against BLE-commanded motion is NOT yet
+        confirmed (the one real attempt stopped on its own for an
+        unexplained reason). Stay ready to intervene.
+        """
+        _LOGGER.warning(
+            "Cover %s: sending TEST Reverse command byte=0x%02X (table=%d device=0x%02X) — "
+            "THIS STARTS MOTION with no auto-stop attached; Stop's reliability against "
+            "self-commanded motion is unconfirmed; be ready to intervene",
+            self.device_name(table_id, device_id),
+            CommandBuilder.HBRIDGE_COMMAND_REVERSE,
+            table_id,
+            device_id,
+        )
+        cmd = self._cmd.build_action_hbridge(
+            table_id, device_id, CommandBuilder.HBRIDGE_COMMAND_REVERSE
+        )
+        await self.async_send_command(cmd)
+
+    async def _hbridge_test_forward_loop(self, table_id: int, device_id: int) -> None:
+        """DIAGNOSTIC: resend Forward every ~500ms with NO auto-stop condition
+        — purely for capturing the extend current profile. Unlike
+        _hbridge_close_loop, there is deliberately no stall/current check
+        here; that's the open question this exists to help answer. Only the
+        hard watchdog below or explicit cancellation (async_stop_hbridge_motion
+        — same path as the manual Stop button and real cover.stop_cover) end
+        this. There is NO auto-reverse safety behavior on this hardware —
+        driven past full extension, the fabric just keeps wrapping backward
+        on the roller toward the RV sidewall. The watchdog below is an
+        arbitrary diagnostic ceiling, not a guarantee against reaching it —
+        not a substitute for stopping manually well before full extension.
+        """
+        key = _device_key(table_id, device_id)
+        name = self.device_name(table_id, device_id)
+        start = time.monotonic()
+        stop_reason = "cancelled"
+        try:
+            while True:
+                elapsed = time.monotonic() - start
+                if elapsed > _HBRIDGE_TEST_FORWARD_MAX_RUNTIME_S:
+                    stop_reason = "watchdog_timeout"
+                    _LOGGER.error(
+                        "Cover %s: TEST Forward watchdog ceiling (%.0fs) reached — "
+                        "stopping unconditionally. No auto-stop condition exists for "
+                        "extend yet; this firing means it wasn't stopped manually in time.",
+                        name, _HBRIDGE_TEST_FORWARD_MAX_RUNTIME_S,
+                    )
+                    break
+                cmd = self._cmd.build_action_hbridge(
+                    table_id, device_id, CommandBuilder.HBRIDGE_COMMAND_FORWARD
+                )
+                try:
+                    await self.async_send_command(cmd)
+                except BleakError as exc:
+                    stop_reason = "command_failed"
+                    _LOGGER.warning("Cover %s: TEST Forward send failed: %s — stopping", name, exc)
+                    break
+                await asyncio.sleep(_HBRIDGE_RESEND_INTERVAL_S)
+        except asyncio.CancelledError:
+            stop_reason = "cancelled_externally"
+        finally:
+            self._hbridge_motion_tasks.pop(key, None)
+        _LOGGER.warning("Cover %s: TEST Forward stopping (%s)", name, stop_reason)
+        await self._send_hbridge_stop_burst(table_id, device_id)
+
+    async def async_start_hbridge_test_forward(self, table_id: int, device_id: int) -> None:
+        """DIAGNOSTIC: start continuous Forward resend with NO auto-stop —
+        see _hbridge_test_forward_loop. Cancel via async_stop_hbridge_motion,
+        same as everything else (it cancels whatever's in _hbridge_motion_tasks
+        regardless of direction).
+        """
+        key = _device_key(table_id, device_id)
+        name = self.device_name(table_id, device_id)
+        existing = self._hbridge_motion_tasks.get(key)
+        if existing and not existing.done():
+            existing.cancel()
+        _LOGGER.warning(
+            "Cover %s: starting TEST Forward — NO auto-stop condition, purely diagnostic. "
+            "Hardware does NOT auto-reverse past full extension — it keeps wrapping the "
+            "fabric backward toward the RV sidewall. Watch closely, stop manually well "
+            "before full extension (table=%d device=0x%02X)",
+            name, table_id, device_id,
+        )
+        self._hbridge_motion_tasks[key] = self.hass.async_create_background_task(
+            self._hbridge_test_forward_loop(table_id, device_id),
+            name=f"ha_onecontrol_hbridge_test_forward_{device_id:02x}",
+        )
+
+    async def _hbridge_open_loop(self, table_id: int, device_id: int) -> None:
+        """Resend Forward every ~500ms until stopped — mirrors
+        _hbridge_close_loop's structure, using
+        self._extend_stall_inference.is_stalled() (4.0A, 1-sample confirm,
+        2-sample warm-up) instead of the retract detector. Uses
+        is_stalled(), not get()/"stopped"-frame inference, for the same
+        reason _hbridge_close_loop does: this loop's own continuous
+        resending may itself suppress the "stopped" status transition
+        passive inference waits for.
+
+        Promoted to the real cover's open_cover after 6 hardware trials of
+        tuning (see protocol/cover_inference.py for the full history) — the
+        last two (logs-26 sanity check, logs-29) produced a small,
+        user-confirmed-acceptable overshoot with no false triggers. A
+        current-dip trigger (ExtendDipDetector, same module) was tried ahead
+        of this ramp detector and reverted after a live false-early-stop
+        (logs-27) — see the note by self._hbridge_stall_events in __init__.
+        Ramp-only; a small overshoot is the accepted tradeoff, same
+        reasoning the user gave for keeping it. There is still NO
+        auto-reverse backstop on this hardware — if this detector and the
+        watchdog below both fail, nothing stops the wrap toward the RV
+        sidewall.
+
+        Stops when: the impact current is confirmed, the watchdog ceiling
+        fires (no confirmed impact — treat as a failure needing
+        investigation before trusting the detector further), a send fails,
+        or the task is cancelled externally (async_stop_hbridge_motion).
+        Always finishes with a stop burst, same as every other hbridge loop.
+
+        Waits on self._hbridge_stall_events[key] instead of a plain sleep,
+        so _update_cover_stall_inference can wake this loop the instant
+        is_stalled() goes true — confirmed on real hardware (temp/logs-23)
+        that a plain per-iteration poll adds up to a full
+        _HBRIDGE_RESEND_INTERVAL_S of pure lag on top of an already-steep
+        ramp, worsening the overshoot independent of threshold tuning.
+        """
+        key = _device_key(table_id, device_id)
+        name = self.device_name(table_id, device_id)
+        start = time.monotonic()
+        stop_reason = "cancelled"
+        impact_event = asyncio.Event()
+        self._hbridge_stall_events[key] = impact_event
+        try:
+            while True:
+                elapsed = time.monotonic() - start
+                if elapsed > _HBRIDGE_MAX_OPEN_RUNTIME_S:
+                    stop_reason = "watchdog_timeout"
+                    _LOGGER.error(
+                        "Cover %s: auto-extend watchdog ceiling (%.0fs) reached without "
+                        "a confirmed impact — stopping unconditionally. The extend stall "
+                        "detector did not fire; investigate before relying on auto-extend again.",
+                        name, _HBRIDGE_MAX_OPEN_RUNTIME_S,
+                    )
+                    break
+                if self._extend_stall_inference.is_stalled(key):
+                    stop_reason = "extend_impact_confirmed"
+                    break
+                impact_event.clear()
+                cmd = self._cmd.build_action_hbridge(
+                    table_id, device_id, CommandBuilder.HBRIDGE_COMMAND_FORWARD
+                )
+                try:
+                    await self.async_send_command(cmd)
+                except BleakError as exc:
+                    stop_reason = "command_failed"
+                    _LOGGER.warning("Cover %s: auto-extend send failed: %s — stopping", name, exc)
+                    break
+                # Re-check immediately: a frame confirming the stall may have
+                # arrived (and set impact_event) while the send above was
+                # awaiting — clearing the event beforehand and checking again
+                # now means that signal is never silently dropped.
+                if self._extend_stall_inference.is_stalled(key):
+                    stop_reason = "extend_impact_confirmed"
+                    break
+                try:
+                    await asyncio.wait_for(
+                        impact_event.wait(), timeout=_HBRIDGE_RESEND_INTERVAL_S
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            stop_reason = "cancelled_externally"
+        finally:
+            self._hbridge_stall_events.pop(key, None)
+            self._hbridge_motion_tasks.pop(key, None)
+        _LOGGER.info("Cover %s: auto-extend stopping (%s)", name, stop_reason)
+        await self._send_hbridge_stop_burst(table_id, device_id)
+
+    async def async_start_hbridge_open(self, table_id: int, device_id: int) -> None:
+        """Start auto-extend: resend Forward every ~500ms until the impact
+        stall detector confirms full extension, a watchdog fires, or
+        async_stop_hbridge_motion cancels it. Cancels any existing motion
+        loop for this device first.
+        """
+        key = _device_key(table_id, device_id)
+        name = self.device_name(table_id, device_id)
+        existing = self._hbridge_motion_tasks.get(key)
+        if existing and not existing.done():
+            existing.cancel()
+        _LOGGER.warning(
+            "Cover %s: starting auto-extend — will stop on a confirmed %.1fA impact "
+            "current, watchdog ceiling %.0fs (table=%d device=0x%02X)",
+            name, DEFAULT_EXTEND_STALL_CURRENT_A,
+            _HBRIDGE_MAX_OPEN_RUNTIME_S, table_id, device_id,
+        )
+        self._hbridge_motion_tasks[key] = self.hass.async_create_background_task(
+            self._hbridge_open_loop(table_id, device_id),
+            name=f"ha_onecontrol_hbridge_open_{device_id:02x}",
+        )
+
+    async def _send_hbridge_stop_burst(self, table_id: int, device_id: int) -> None:
+        """Send Stop a handful of times, not once — matches the vendor's own
+        MaxStopCommands=5 pattern (LogicalDeviceRelayHBridgeMomentary.cs),
+        since a single Stop send isn't assumed reliable. Even if every send
+        here fails, the device's own ~800ms no-refresh auto-stop watchdog
+        (see _HBRIDGE_RESEND_INTERVAL_S note) halts motion shortly after we
+        stop resending the direction command — this burst is a fast-path,
+        not the only thing standing between "cancelled" and "actually stopped".
+        """
+        name = self.device_name(table_id, device_id)
+        for attempt in range(_HBRIDGE_STOP_BURST_COUNT):
+            try:
+                cmd = self._cmd.build_action_hbridge(
+                    table_id, device_id, CommandBuilder.HBRIDGE_COMMAND_STOP
+                )
+                await self.async_send_command(cmd)
+            except BleakError as exc:
+                _LOGGER.warning(
+                    "Cover %s: stop-burst send %d/%d failed: %s",
+                    name, attempt + 1, _HBRIDGE_STOP_BURST_COUNT, exc,
+                )
+                break
+            if attempt < _HBRIDGE_STOP_BURST_COUNT - 1:
+                await asyncio.sleep(_HBRIDGE_STOP_BURST_INTERVAL_S)
+
+    async def _hbridge_close_loop(self, table_id: int, device_id: int) -> None:
+        """Resend Reverse every ~500ms until stopped — mirrors the vendor
+        app's PerformMovementOperationAsync loop. Stops when: sustained
+        stall-level current is observed directly (CoverStallInference.is_stalled
+        — NOT the passive get()/"closed" inference, which waits for a
+        "stopped" status frame that this loop's own continuous resending was
+        observed to suppress on real hardware: the device kept reporting
+        "closing" for 6+ seconds of stall current because it kept receiving
+        fresh Reverse commands, only settling to "stopped" once resending
+        actually stopped), a hard runtime watchdog fires (no stall observed
+        — treat as a failure needing investigation, not silently keep
+        running), a send fails, or the task is cancelled externally
+        (async_stop_hbridge_motion). Always finishes by sending a stop burst,
+        after which the normal passive inference confirms closed via the
+        "stopped" frame this produces, same as wall-switch-driven motion.
+
+        Waits on self._hbridge_stall_events[key] instead of a plain sleep —
+        see _hbridge_open_loop's docstring for why a plain
+        per-iteration poll adds up to a full _HBRIDGE_RESEND_INTERVAL_S of
+        pure lag between the stall actually confirming and this loop
+        noticing. Retract has a much wider safety margin than extend, but
+        the same latency applied here too — no reason to leave it in.
+        """
+        key = _device_key(table_id, device_id)
+        name = self.device_name(table_id, device_id)
+        start = time.monotonic()
+        stop_reason = "cancelled"
+        stall_event = asyncio.Event()
+        self._hbridge_stall_events[key] = stall_event
+        try:
+            while True:
+                elapsed = time.monotonic() - start
+                if elapsed > _HBRIDGE_MAX_CLOSE_RUNTIME_S:
+                    stop_reason = "watchdog_timeout"
+                    _LOGGER.error(
+                        "Cover %s: auto-retract watchdog ceiling (%.0fs) reached without "
+                        "a confirmed stall — stopping unconditionally. The stall detector "
+                        "did not fire; investigate before relying on auto-retract again.",
+                        name, _HBRIDGE_MAX_CLOSE_RUNTIME_S,
+                    )
+                    break
+                if self._cover_stall_inference.is_stalled(key):
+                    stop_reason = "stall_confirmed"
+                    break
+                stall_event.clear()
+                cmd = self._cmd.build_action_hbridge(
+                    table_id, device_id, CommandBuilder.HBRIDGE_COMMAND_REVERSE
+                )
+                try:
+                    await self.async_send_command(cmd)
+                except BleakError as exc:
+                    stop_reason = "command_failed"
+                    _LOGGER.warning("Cover %s: auto-retract send failed: %s — stopping", name, exc)
+                    break
+                if self._cover_stall_inference.is_stalled(key):
+                    stop_reason = "stall_confirmed"
+                    break
+                try:
+                    await asyncio.wait_for(
+                        stall_event.wait(), timeout=_HBRIDGE_RESEND_INTERVAL_S
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            stop_reason = "cancelled_externally"
+        finally:
+            self._hbridge_stall_events.pop(key, None)
+            self._hbridge_motion_tasks.pop(key, None)
+        _LOGGER.info("Cover %s: auto-retract stopping (%s)", name, stop_reason)
+        await self._send_hbridge_stop_burst(table_id, device_id)
+
+    async def async_start_hbridge_close(self, table_id: int, device_id: int) -> None:
+        """Start auto-retract: resend Reverse every ~500ms until the stall
+        detector confirms closed, a watchdog fires, or async_stop_hbridge_motion
+        cancels it. Cancels any existing motion loop for this device first.
+        """
+        key = _device_key(table_id, device_id)
+        name = self.device_name(table_id, device_id)
+        existing = self._hbridge_motion_tasks.get(key)
+        if existing and not existing.done():
+            existing.cancel()
+        _LOGGER.warning(
+            "Cover %s: starting auto-retract (table=%d device=0x%02X)",
+            name, table_id, device_id,
+        )
+        self._hbridge_motion_tasks[key] = self.hass.async_create_background_task(
+            self._hbridge_close_loop(table_id, device_id),
+            name=f"ha_onecontrol_hbridge_close_{device_id:02x}",
+        )
+
+    async def async_stop_hbridge_motion(self, table_id: int, device_id: int) -> None:
+        """Cancel any active auto-motion loop for this device.
+
+        Also sends an explicit stop burst itself when no loop is running —
+        covers interrupting motion this integration didn't start (e.g. the
+        wall switch), matching the already-confirmed-working manual Stop path.
+        """
+        key = _device_key(table_id, device_id)
+        task = self._hbridge_motion_tasks.get(key)
+        if task and not task.done():
+            task.cancel()
+        else:
+            await self._send_hbridge_stop_burst(table_id, device_id)
 
     async def async_set_dimmable(
         self, table_id: int, device_id: int, brightness: int
@@ -2243,12 +2744,28 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         event: CoverStatus | RelayStatus | None = None
 
         if dev_type == 33:  # H-Bridge / cover (slide-out, awning)
+            # RELAY_TYPE_2_STATUS_PARAMS: status, position, current draw (u16 BE,
+            # /256=Amps, 0xFFFF=unsupported), DTC/user-message (u16 BE, unused here).
+            _LOGGER.debug(
+                "CAN BLE: H-Bridge status src=0x%02X (%s) raw=%s",
+                src,
+                self.device_name(0, src),
+                payload.hex(),
+            )
             status = payload[0] if len(payload) >= 1 else 0xC0
             pos: int | None = payload[1] if len(payload) >= 2 else None
             if pos == 0xFF:
                 pos = None
-            event = CoverStatus(table_id=0, device_id=src, status=status, position=pos)
+            current: float | None = None
+            if len(payload) >= 4:
+                raw_current = (payload[2] << 8) | payload[3]
+                if raw_current != 0xFFFF:
+                    current = raw_current / 256.0
+            event = CoverStatus(
+                table_id=0, device_id=src, status=status, position=pos, current_draw=current
+            )
             self.covers[key] = event
+            self._update_cover_stall_inference(event)
 
         elif dev_type == 30:  # Relay (light, switch)
             status_byte = payload[0] if len(payload) >= 1 else 0x00
@@ -3638,7 +4155,17 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         elif isinstance(event, CoverStatus):
             key = _device_key(event.table_id, event.device_id)
+            # Host-protocol event dispatch above only logs the parsed class name,
+            # not the raw bytes — log the full frame here so H-Bridge payload
+            # bytes beyond status/position can be characterized before any new
+            # entities are added for them.
+            _LOGGER.debug(
+                "Host: CoverStatus %s raw=%s",
+                self.device_name(event.table_id, event.device_id),
+                frame.hex(),
+            )
             self.covers[key] = event
+            self._update_cover_stall_inference(event)
             self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, list):
