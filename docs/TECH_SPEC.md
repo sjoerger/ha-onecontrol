@@ -199,18 +199,58 @@ ActionRgb (command `0x44`) SOLID wire format:
 
 Brightness control in HA is implemented by scaling R/G/B channel values proportionally: `ch_scaled = min(255, round(ch * brightness / max(R, G, B)))`.
 
+### 5.6 H-Bridge Cover Control (Awning/Slide)
+
+An "awning" is not a distinct device type at the protocol level — it's a generic `RelayHBridge` motor driver (`DEVICE_TYPE==33`), the same class slides/roof-lifts use. No official documentation exists for this device family; everything below was reverse-engineered from the decompiled vendor Android/MAUI app cross-checked against real BLE captures.
+
+**Status frame** (event `0x0D`/`0x0E`, `parse_cover_status`): status byte `0xC0`=stopped, `0xC2`=opening, `0xC3`=closing. Position is **always `0xFF`/unavailable** on every hardware unit tested — no live position feedback exists for this integration to build on. Current draw is at frame bytes 5-6 (`uint16` BE `/256` = Amps; `0xFFFF` = device doesn't report it, seen on Slides where only the Awning wires up this field), mirroring the IDS-CAN `RELAY_TYPE_2_STATUS_PARAMS` layout.
+
+**Command frame** (`ActionHBridge`, cmd `0x41`, `build_action_hbridge`): 6 bytes, `[cmdid_lsb][cmdid_msb][0x41][table][device][command]`. The command byte uses `RelayHBridgeDirection` numbering, **not** the vendor's `HBridgeCommand` enum (the two decompiled enums overlap on small integers for different things): `Stop=0x00`, `Forward=0x02` (extend), `Reverse=0x03` (retract) — all three confirmed against real hardware across many trials. The overall frame shape is pattern-matched from other single-device action builders and has not been confirmed against real official-app BLE traffic (there's no MyRvLink-layer source for it in the decompiled code, only the transport-agnostic bare-command-byte layer).
+
+**Hold-to-move mechanism**, confirmed from decompiled `LogicalDeviceRelayHBridgeMomentary.cs`: the vendor app resends the direction command every 500ms while a button is held, and the device has its **own 800ms auto-stop watchdog** if no fresh direction command arrives — a real, vendor-confirmed safety backstop independent of anything this integration does. Neither the wall switch nor the vendor app has a dedicated Stop button — the only stop mechanism on either is releasing the button. The vendor never trusts a single Stop send either (`MaxStopCommands=5` on release; a dedicated panic-stop path retries 10x at 500ms intervals) — this integration follows the same pattern (`_send_hbridge_stop_burst`).
+
+**Current signatures differ sharply by direction:**
+
+| | Retract (closing) | Extend (opening) |
+|---|---|---|
+| Steady running | 0.6-8.4A | ~1.7-2.2A (tight band) |
+| End-of-travel signature | 15-17A held 2+ samples at the fully-retracted mechanical stop | ~10.2-10.3A impact ramp at full extension (up to 13A if restarting from an already-extended position) |
+| If driven past the limit | N/A (hard mechanical stop) | Current does **not** return to baseline — plateaus 6-10A for as long as it's driven |
+
+Extend has **no device-side backstop past full extension** — there is no auto-reverse (an earlier working assumption to the contrary was directly contradicted by the user holding the wall switch continuously for 10s past the limit with no self-correction). Driven further, the fabric simply keeps wrapping backward on the roller toward the RV sidewall; only a human, the current-based auto-stop detector, or the runtime watchdog can end it.
+
+**Auto-stop detection** (`protocol/cover_inference.py`, `coordinator.py`): `CoverStallInference` is a generic streak-based detector parameterized by `target_state` ("closing" for retract, "opening" for extend), one instance per direction:
+
+- **Retract**: 10.0A threshold, 2-sample confirm (the real signal is noisy enough to need it). Also feeds the passive `is_closed` inference via `get()`/`update()` — `True` only after a closing motion ends in a confirmed stall, `False` the instant any opening motion is observed, `None` until either has been seen.
+- **Extend**: 4.0A threshold, 1-sample confirm (the ramp is fast and clean — a 2-sample confirm was tried first and let the awning overshoot further, since by the 2nd confirming sample current was already near the unimpeded peak), plus a 2-sample warm-up gate (skips the startup inrush spike, which alone regularly exceeds this low a threshold).
+
+Both `_hbridge_close_loop` and `_hbridge_open_loop` resend their direction command every 500ms and check `is_stalled()` each iteration — but rather than a plain sleep between resends, both wait on a shared `asyncio.Event` per device (`coordinator._hbridge_stall_events`) that `_update_cover_stall_inference` sets the instant a detector fires, so the loop reacts within milliseconds instead of waiting up to a full 500ms for its own poll cycle. Runtime watchdogs (60s close, 40s open) are a backstop against a missed/failed detection, not the primary stop mechanism.
+
+A current-*dip* based trigger for extend (`ExtendDipDetector`, same module) was also built and live-tested: four independent trials showed a ~1s current dip-then-recover pattern immediately preceding the ramp, matching a user-observed physical pause at full extension almost to the second, and triggering on it recovered nearly a full second versus the ramp-based trigger. It was **reverted** after a 5th live trial produced a false-early-stop (the awning stopped ~2s short of full extension) — the margin between confirmed real dips and confirmed false triggers proved too thin (~0.3A) on the trial count available. The class remains in the module, unwired, in case it's worth revisiting with substantially more data.
+
+**Known limitations:**
+- `is_closed` is a best-effort current-based inference, not a measured value — no minimum-duration guard is enforced, so a mid-travel obstruction producing the same current spike as a real stop would also read as "closed."
+- Extend auto-stop carries a small, user-accepted current-threshold overshoot (roughly the ~300ms BLE status-frame reporting gap plus physical motor/roller stop momentum) — validated across multiple trials as minor and not causing problems on subsequent retracts.
+- Since position is never available, `OneControlCover` sets `assumed_state = True`. Without it, the stock HA cover card infers "fully open"/"fully closed" purely from `is_closed` and greys out the opposite directional button after any partial motion — there is no way to represent "partially extended" otherwise.
+
 ## 6. State and Entity Model
 
 - Switch entities map relay actions and status.
 - Light entities include dimmable and RGB variants.
 - Climate entities model per-zone HVAC mode/fan/setpoint state.
 - Sensor/binary/button entities expose tanks, system status, lockout, diagnostics, and controls.
+- Cover entities (Awning/Slide) expose full Open/Close/Stop control (`assumed_state = True` — see §5.6),
+  backed by the current-based auto-stop loops. `sensor.<device>_motor_current` and a text-state sensor
+  (`sensor.<device>_cover_state`, predates the cover entity) also exist per device.
 
 ## 7. Command and Control Surface
 
 - Relay and light action commands route through coordinator write path.
 - HVAC command path includes pending-window suppression and setpoint retry logic.
 - Metadata refresh and lockout/maintenance actions are exposed via platform controls.
+- H-bridge cover control resends its direction command every 500ms while active (matching the vendor
+  app's own hold-to-move cadence) and stops on a current-based auto-stop detector, a runtime watchdog, or
+  explicit cancellation — see §5.6 for the full detector/loop design.
 
 Command builder wire format is:
 
@@ -253,13 +293,18 @@ Core operational timers:
 
 ## 9. Diagnostics and Observability
 
-- integration diagnostics export coordinator state and protocol counters
+- integration diagnostics export coordinator state and protocol counters, including per-cover
+  `current_draw` for troubleshooting the H-bridge auto-stop detectors (§5.6)
 - metadata correlation and unknown-command statistics retained for troubleshooting
 - entity availability reflects connection and data freshness
 
 ## 10. Security and Safety Notes
 
-- cover behavior is conservative and state-oriented for movement safety
+- H-bridge cover control (Awning/Slide) actively drives 19-39A motors with no limit switches and no
+  device-side backstop for extend (§5.6) — both directions are gated on a current-based auto-stop
+  detector plus a runtime watchdog, not a hardware safety mechanism. Detector thresholds are derived from
+  a limited number of real hardware trials per direction and should be re-validated if this hardware
+  family's behavior is ever seen to differ (different current draw, different travel timing, etc.).
 - sensitive key-schedule values are not stored as plain constants
 - PIN-based gateway behavior depends on host BLE capabilities
 - gateway authentication is not a single mechanism across all models; BLE SMP bond, MyRvLink TEA unlock, CAN-BLE key/seed, and CAN password unlock may appear independently depending on controller family
@@ -280,6 +325,7 @@ Recent trajectory includes:
 - **v1.0.31 — Experimental X180T support:** Added the official X180T primary service UUID, modern Lippert TLV manufacturer data parsing, official `ConnectionInfo` pairing-method mapping, X180T gateway-family config data, empty X180T CAN password handling, and X180T routing into CAN-BLE with key/seed cipher `0xC81D7F20`.
 - **v1.0.32 — X180T connect-first pairing follow-up:** Updated X180T push-button pairing order to register the Just Works agent, connect GATT first, then call `pair()` post-connect, matching the official app flow more closely. Also added stale-bond cleanup for X180T and prevented CAN-BLE auth from marking the gateway authenticated when service discovery or `CAN_READ` subscription has not completed.
 - **v1.0.43 — CAN-BLE NETWORK-frame aggregation:** IDS-CAN NETWORK (`mt=0x00`) frames are broadcast per node, each carrying that node's own protocol version and in-motion-lockout bits. The dispatcher previously overwrote gateway-level state from whichever frame arrived last, so the Protocol Version sensor flapped between every node's value several times a second and churned the recorder. Now tracked per source address and aggregated — in-motion lockout as the MAX across active nodes (parity with the official app's `LogicalDeviceService.InMotionLockoutLevel`), protocol version as the MAX observed on the bus — with a coordinator update pushed only when an aggregate actually changes.
+- **v1.0.44 — H-bridge Awning cover control (Open/Close/Stop):** The `cover` platform was never registered in `PLATFORMS` — cover entities existed in code but never loaded. Fixed, then built out full control: `close_cover` (auto-retract, 10A/2-sample stall detector — validated over 10+ trials) already existed; `open_cover` (auto-extend) is new, gated on a 4.0A/1-sample/2-sample-warmup current-impact detector reached after several rounds of live-hardware tuning (see §5.6). Both loops share an event-driven wake-up so they react within ms of a detector firing instead of polling on a fixed interval — this measurably improved retract responsiveness too (500ms → 7ms observed reaction time on one trial). Added a `Motor Current` sensor per H-bridge device, `current_draw` to diagnostics export, and `assumed_state = True` on the cover entity (position is never available on this hardware, so the stock HA cover card was greying out the opposite directional button after any partial motion). A current-dip-based extend trigger was explored and reverted after a live false-early-stop — see §5.6.
 
 ## 12. Known Constraints
 
@@ -287,6 +333,9 @@ Recent trajectory includes:
 - X180T support remains experimental pending hardware validation; it combines BLE pairing/bonding, CAN-BLE runtime, and key/seed unlock in a hybrid model
 - gateway firmware/protocol variance can require parser updates
 - friendly naming depends on successful metadata completion
+- H-bridge cover position is never available on hardware tested so far — `is_closed` and the auto-stop
+  detectors are current-draw inference, not measured state/position; thresholds are derived from a
+  limited number of hardware trials per direction (§5.6, §10)
 
 ## 13. Extension Guidelines
 

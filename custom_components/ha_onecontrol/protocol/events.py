@@ -212,16 +212,27 @@ class HvacZone:
 class CoverStatus:
     """H-Bridge / cover status (event 0x0D/0x0E).
 
-        INTERNALS.md § Cover/Slide/Awning:
-            STATE-ONLY.  No commands (safety: no limit switches, 19-39A motors).
+        docs/TECH_SPEC.md § H-Bridge Cover Control:
             Legacy host events use 0xC0=stopped, 0xC2=opening, 0xC3=closing.
             IDS-CAN DEVICE_STATUS commonly reports 0x00 for stopped/idle.
+            Both directions are commandable (ActionHBridge, cmd 0x41) with
+            current-based auto-stop — see coordinator._hbridge_close_loop /
+            _hbridge_open_loop and protocol/cover_inference.py.
+
+        current_draw: from RELAY_TYPE_2_STATUS_PARAMS bytes 2-3 (uint16 BE, /256
+            = Amps).  0xFFFF means the device doesn't report current (seen on
+            slides on hardware that only wires it up for the awning H-bridge) —
+            decoded as None, not 255.99 A.  Retract stall holds 15-17A for
+            several seconds against the fully-retracted mechanical stop; extend
+            has its own impact spike at full extension (~10.2-10.3A on a clean
+            run) — both directions have a comparable signature.
     """
 
     table_id: int = 0
     device_id: int = 0
     status: int = 0
     position: int | None = None  # 0-100 or None if 0xFF
+    current_draw: float | None = None  # Amps, None if unsupported (0xFFFF)
 
     @property
     def ha_state(self) -> str:
@@ -578,20 +589,33 @@ def parse_hvac_status(data: bytes) -> list[HvacZone]:
 def parse_cover_status(data: bytes) -> CoverStatus | None:
     """Parse H-Bridge status (0x0D/0x0E).
 
-    INTERNALS.md § Cover/Slide/Awning:
-      STATE-ONLY — no control commands published.
-      Position: 0xFF = unavailable.
+    docs/TECH_SPEC.md § H-Bridge Cover Control:
+      Position: 0xFF = unavailable (always, on hardware tested so far —
+      current-draw-based auto-stop exists specifically because position
+      can't be used for it).
+
+    Bytes 5-6 (current draw) and 7-8 (DTC/user-message) mirror the IDS-CAN
+    RELAY_TYPE_2_STATUS_PARAMS layout — verified against
+    temp/decompiled_source/assembly_0091/IDS.Core.IDS_CAN.Devices/
+    RELAY_TYPE_2_STATUS_PARAMS.cs.  Current draw is uint16 BE, /256 = Amps;
+    0xFFFF means the device doesn't report it.
     """
     if len(data) < 4:
         return None
     pos = data[4] if len(data) > 4 else None
     if pos is not None and pos == 0xFF:
         pos = None
+    current: float | None = None
+    if len(data) >= 7:
+        raw_current = (data[5] << 8) | data[6]
+        if raw_current != 0xFFFF:
+            current = raw_current / 256.0
     return CoverStatus(
         table_id=data[1],
         device_id=data[2],
         status=data[3],
         position=pos,
+        current_draw=current,
     )
 
 

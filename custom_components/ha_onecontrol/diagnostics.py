@@ -157,6 +157,7 @@ async def async_get_config_entry_diagnostics(
         covers[key] = {
             "status": cover.status,
             "position": cover.position,
+            "current_draw": cover.current_draw,
             "name": coordinator.device_name(cover.table_id, cover.device_id),
         }
 

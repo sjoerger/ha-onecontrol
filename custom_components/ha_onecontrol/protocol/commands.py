@@ -106,6 +106,49 @@ class CommandBuilder:
         return header + bytes(d & 0xFF for d in device_ids)
 
     # ------------------------------------------------------------------
+    # H-Bridge (0x41) — relay H-bridge motor driver (awning, slide, etc.)
+    #
+    # UNVERIFIED payload shape. Unlike the other build_action_* methods,
+    # this has never been confirmed against a real capture of the official
+    # app's BLE traffic — there's no MyRvLink-layer source for it (the
+    # decompiled vendor app only covers the transport-agnostic
+    # LogicalDeviceCommandPacket layer: a bare command byte). This shape is
+    # pattern-matched from the other single-device action builders
+    # (build_action_generator is the closest analog).
+    #
+    # Command byte: two different decompiled enums use overlapping small
+    # integers for different things —
+    #   HBridgeCommand:        Stop=0, Forward=1, Reverse=2, ...
+    #   RelayHBridgeDirection: Stop=0, Forward=2, Reverse=3
+    # Confirmed on real hardware across many trials: this command byte
+    # matches RelayHBridgeDirection, not HBridgeCommand. Forward (2) extends,
+    # Reverse (3) retracts. Stop (0, same value in both enums) reliably halts
+    # motion this integration itself started — see coordinator.py
+    # _hbridge_close_loop / _hbridge_open_loop / async_stop_hbridge_motion,
+    # and docs/TECH_SPEC.md § H-Bridge Cover Control for the auto-stop
+    # detectors built on top of this command.
+    # ------------------------------------------------------------------
+
+    HBRIDGE_COMMAND_STOP = 0x00
+    HBRIDGE_COMMAND_FORWARD = 0x02  # confirmed: extends
+    HBRIDGE_COMMAND_REVERSE = 0x03  # confirmed: retracts
+
+    def build_action_hbridge(
+        self, device_table_id: int, device_id: int, command: int
+    ) -> bytes:
+        """Build an ActionHBridge command (6 bytes). See module note above — unverified."""
+        cid = self._next_id()
+        return (
+            self._id_bytes(cid)
+            + bytes([
+                self.CMD_ACTION_HBRIDGE,
+                device_table_id & 0xFF,
+                device_id & 0xFF,
+                command & 0xFF,
+            ])
+        )
+
+    # ------------------------------------------------------------------
     # Dimmable Light (0x43)
     # ------------------------------------------------------------------
 

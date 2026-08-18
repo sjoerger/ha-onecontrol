@@ -138,7 +138,7 @@ HVAC_PRESET_HEAT_PUMP = "Prefer Heat Pump"
 HVAC_PRESET_NONE = "none"
 
 # ---------------------------------------------------------------------------
-# Cover status byte values (state-only, no commands — INTERNALS.md § Cover)
+# Cover status byte values — see docs/TECH_SPEC.md § H-Bridge Cover Control
 # ---------------------------------------------------------------------------
 COVER_STOPPED = 0xC0
 COVER_OPENING = 0xC2
